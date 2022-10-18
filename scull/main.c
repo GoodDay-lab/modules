@@ -18,34 +18,15 @@
 #include <linux/semaphore.h>
 
 #include "scull.h"
+#include "round_buffer.h"
 
-struct message_item;
 struct device_info {
     struct cdev cdev;
     struct mutex lock;
-    ssize_t length;
-    struct message_item *items;
+    struct rounded_buffer buffer;
 };
 
 struct device_info *scull_devices;
-
-struct message_item {
-    kuid_t user;
-    ssize_t buffer_size;
-    char buffer[BUFFER_SIZE];
-    struct message_item *next;
-};
-
-void device_clear(struct device_info *dev)
-{
-    struct message_item *item;
-
-    while ((item = dev->items) != NULL) {
-        dev->items = item->next;
-        kfree(item);
-    }
-    dev->length = 0;
-}
 
 int static lopen(struct inode *inodep, struct file *filp)
 {
@@ -59,63 +40,32 @@ int static lopen(struct inode *inodep, struct file *filp)
 int static lrelease(struct inode *inodep, struct file *filp)
 {
     /*
-     * Will be called when file is closing by process.
-     * Just 1 time even was fork().
+     *  Будет вызвана после закрытия последнего дескриптора 'struct file *'
+     * Примечание: будет вызвана 1 раз, несмотря на вызов 'fork()'
+     *
+     *  Здесь ничего нет, потому что это обеспечит возможность хранить
+     * данные глобально! Одна структура для всех процессов.
      */
     return 0;
 }
 
 ssize_t static lwrite(struct file *filp, const char __user *from_user, size_t sz, loff_t *f_op)
 {
-    int retval;
+    ssize_t retval = sz;
     struct device_info *dev = filp->private_data;
-    struct message_item *item;
-    ssize_t writted_size;
+    struct rounded_buffer *buf = &dev->buffer;
 
-    if (mutex_lock_interruptible(&dev->lock))
-        return -ERESTARTSYS; 
-
-    if ((item = kmalloc(sizeof(struct message_item), GFP_KERNEL)) == NULL) {
-        retval = -ENOMEM;
-        goto out;
-    }
-    writted_size = MINIMAL(sz, BUFFER_SIZE);
-    if (copy_from_user(item->buffer, from_user, writted_size)) {
-        kfree(item);
-        retval = -EFAULT;
-        goto out;
-    }
-    item->user = current->cred->uid;
-    item->buffer_size = writted_size;
-    item->next = dev->items;
-    dev->items = item;
-    dev->length += 1;
-    retval = writted_size;
-
-out:
-    mutex_unlock(&dev->lock);
+    rounded_buffer_add_item(buf, from_user, &retval);
     return retval;
 }
 
 ssize_t static lread(struct file *filp, char __user *to_user, size_t sz, loff_t *f_op)
 {
-    int retval;
+    ssize_t retval = sz;
     struct device_info *dev = filp->private_data;
-    struct message_item *item = dev->items;
-    ssize_t readed_size;
+    struct rounded_buffer *buf = &dev->buffer;
 
-    if (dev->length <= 0) return 0;
-    readed_size = MINIMAL(sz, item->buffer_size);
-    if (copy_to_user(to_user, item->buffer, readed_size)) {
-        retval = -EFAULT;
-        goto out;
-    }
-    dev->items = item->next;
-    kfree(item);
-    dev->length -= 1;
-    retval = readed_size;
-
-out:
+    rounded_buffer_get_item(buf, to_user, &retval);
     return retval;
 }
 
@@ -157,6 +107,7 @@ int static __init scull_init(void)
         mutex_init(&dev->lock);
         cdev_init(&dev->cdev, &f_ops);
         dev->cdev.owner = THIS_MODULE;
+        rounded_buffer_init(&dev->buffer, 20);
         local_device_num = MKDEV(MAJOR(device_number), MINOR(device_number) + counter);
         if (cdev_add(&dev->cdev, local_device_num, 1)) {
             retval = -ERESTART;
@@ -175,7 +126,7 @@ void static __exit scull_exit(void)
     struct device_info *dev;
     for (counter = 0; counter < CHRDEV_COUNT; counter++) {
         dev = &scull_devices[counter];
-        device_clear(dev);
+        rounded_buffer_clear(&dev->buffer);
         cdev_del(&dev->cdev);
     }
     kfree(scull_devices);

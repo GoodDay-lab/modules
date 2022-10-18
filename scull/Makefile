@@ -1,5 +1,5 @@
 obj-m := scull.o
-scull-y := main.o
+scull-y := main.o round_buffer.o
 
 #BUILDROOT = /usr/src/linux-6.0/
 BUILDROOT = /lib/modules/`uname -r`/build
