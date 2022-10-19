@@ -47,10 +47,16 @@ void rounded_buffer_add_item(struct rounded_buffer *ptr, const char *from, size_
     struct rounded_buffer_item *item;
     size_t writted_data = 0;
 
-    if ((ptr->items[ptr->w_head]).flag || from == NULL) {
+    if (ptr->length <= 0 || (ptr->items[ptr->w_head]).flag) {
+        writted_data = -ENOSPC;
+        goto out;
+    }
+    if (from == NULL) {
+        writted_data = -EFAULT;
         goto out;
     }
 
+    printk(KERN_INFO "scull: writing...\n");
     item = &ptr->items[ptr->w_head];
     writted_data = MINIMAL(*size, ROUNDED_BUFFER_ITEM_SIZE);
     memcpy(item->buffer, from, writted_data);
@@ -69,8 +75,13 @@ void rounded_buffer_get_item(struct rounded_buffer *ptr, char *to, size_t *size)
 {
     struct rounded_buffer_item *item;
     size_t readed_data = 0;
-
-    if (!(ptr->items[ptr->r_head]).flag || to == NULL) {
+    
+    if (!(ptr->items[ptr->r_head]).flag || ptr->length <= 0) {
+        readed_data = 0;
+        goto out;
+    }
+    if (to == NULL) {
+        readed_data = -EFAULT;
         goto out;
     }
 

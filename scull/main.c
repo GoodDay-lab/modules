@@ -56,6 +56,7 @@ ssize_t static lwrite(struct file *filp, const char __user *from_user, size_t sz
     struct rounded_buffer *buf = &dev->buffer;
 
     rounded_buffer_add_item(buf, from_user, &retval);
+    if (retval == 0) retval = -EINTR;
     return retval;
 }
 
@@ -107,7 +108,7 @@ int static __init scull_init(void)
         mutex_init(&dev->lock);
         cdev_init(&dev->cdev, &f_ops);
         dev->cdev.owner = THIS_MODULE;
-        rounded_buffer_init(&dev->buffer, 20);
+        rounded_buffer_init(&dev->buffer, 2);
         local_device_num = MKDEV(MAJOR(device_number), MINOR(device_number) + counter);
         if (cdev_add(&dev->cdev, local_device_num, 1)) {
             retval = -ERESTART;
