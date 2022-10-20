@@ -22,14 +22,29 @@ void rounded_buffer_clear(struct rounded_buffer *ptr)
     ptr->length = 0;
 }
 
+void rounded_buffer_clean(struct rounded_buffer *ptr)
+{
+    unsigned int counter;
+    for (counter = 0; counter < ptr->length; counter++) {
+        ptr->items[counter].flag = 0;
+    }
+    ptr->r_head = 0;
+    ptr->w_head = 0;
+}
+
 int rounded_buffer_init(struct rounded_buffer *buf, size_t length)
 {
     buf->items = kmalloc(sizeof(struct rounded_buffer_item) * length, GFP_KERNEL);
     buf->w_head = buf->r_head = 0;
     buf->length = length;
     if (buf->items != NULL) {
-        int i;
-        for (i = 0; i < length; i++) {buf->items[i].flag = 0;}
+        int i, j;
+        for (i = 0; i < length; i++) {
+            buf->items[i].flag = 0;
+            for (j = 0; j < ROUNDED_BUFFER_ITEM_SIZE; j++) {
+                buf->items[i].buffer[i] = 0;
+            }
+        }
     }
     return (buf->items == NULL);
 }
@@ -51,12 +66,11 @@ void rounded_buffer_add_item(struct rounded_buffer *ptr, const char *from, size_
         writted_data = -ENOSPC;
         goto out;
     }
-    if (from == NULL) {
+    if (!access_ok(from, *size)) {
         writted_data = -EFAULT;
         goto out;
     }
 
-    printk(KERN_INFO "scull: writing...\n");
     item = &ptr->items[ptr->w_head];
     writted_data = MINIMAL(*size, ROUNDED_BUFFER_ITEM_SIZE);
     memcpy(item->buffer, from, writted_data);
@@ -80,7 +94,7 @@ void rounded_buffer_get_item(struct rounded_buffer *ptr, char *to, size_t *size)
         readed_data = 0;
         goto out;
     }
-    if (to == NULL) {
+    if (!access_ok(to, *size)) {
         readed_data = -EFAULT;
         goto out;
     }

@@ -17,14 +17,10 @@
  */
 #include <linux/semaphore.h>
 
+#include <linux/capability.h>
+
 #include "scull.h"
 #include "round_buffer.h"
-
-struct device_info {
-    struct cdev cdev;
-    struct mutex lock;
-    struct rounded_buffer buffer;
-};
 
 struct device_info *scull_devices;
 
@@ -56,7 +52,6 @@ ssize_t static lwrite(struct file *filp, const char __user *from_user, size_t sz
     struct rounded_buffer *buf = &dev->buffer;
 
     rounded_buffer_add_item(buf, from_user, &retval);
-    if (retval == 0) retval = -EINTR;
     return retval;
 }
 
@@ -70,6 +65,32 @@ ssize_t static lread(struct file *filp, char __user *to_user, size_t sz, loff_t 
     return retval;
 }
 
+long static lioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    /*
+     *  'cmd' - command parameter, defineds by '_IO()', '_IO{W,R}()', '_IOWR()'
+     */
+    struct device_info *dev = filp->private_data;
+    int retval = 0;
+
+    if (_IOC_TYPE(cmd) != SCULL_IOC_TYPE) return -ENOTTY;
+    if (_IOC_NR(cmd) > SCULL_IOC_MAXNR) return -ENOTTY;
+
+
+    switch (cmd) {
+
+        case SCULL_IOCRESET:
+            if (!capable(CAP_SYS_ADMIN))
+                return -EPERM;
+            rounded_buffer_clean(&dev->buffer);
+            break;
+        
+        default:
+            return -ENOTTY;
+    }
+    return retval;
+}
+
 
 static dev_t device_number;
 static struct file_operations f_ops = {
@@ -77,7 +98,8 @@ static struct file_operations f_ops = {
     .open = &lopen,
     .release = &lrelease,
     .write = &lwrite,
-    .read = &lread
+    .read = &lread,
+    .unlocked_ioctl = &lioctl
 };
 
 int static __init scull_init(void)
