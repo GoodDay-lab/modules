@@ -11,17 +11,20 @@
 #include <linux/uidgid.h>
 #include <linux/slab.h>
 
+#include <linux/poll.h>
+
 /*
  *  Семафор необходим для создания мультипроцессорного ресурса
  * и для минимизации рисков утечки памяти.
  */
 #include <linux/semaphore.h>
-
 #include <linux/capability.h>
+#include <linux/wait.h>
 
 #include "scull.h"
 #include "round_buffer.h"
 
+static DECLARE_WAIT_QUEUE_HEAD(wait_queue_head);
 struct device_info *scull_devices;
 
 int static lopen(struct inode *inodep, struct file *filp)
@@ -91,6 +94,27 @@ long static lioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     return retval;
 }
 
+static unsigned int lpoll(struct file *filp, poll_table *wait)
+{
+    struct device_info *dev = filp->private_data;
+    struct rounded_buffer *buf = &dev->buffer;
+    unsigned int mask = 0;
+
+    if (mutex_lock_interruptible(&dev->lock)) {
+        // If mutex wasn't lock!
+        return -ERESTARTSYS;
+    }
+    
+    poll_wait(filp, &wait_queue_head, wait);
+    if (!rounded_buffer_is_free(buf)) {
+        mask |= POLLIN | POLLRDNORM;
+    } else {
+        mask |= POLLOUT | POLLWRNORM;
+    }
+    mutex_unlock(&dev->lock);
+    return mask;
+}
+
 
 static dev_t device_number;
 static struct file_operations f_ops = {
@@ -99,7 +123,8 @@ static struct file_operations f_ops = {
     .release = &lrelease,
     .write = &lwrite,
     .read = &lread,
-    .unlocked_ioctl = &lioctl
+    .unlocked_ioctl = &lioctl,
+    .poll = &lpoll
 };
 
 int static __init scull_init(void)

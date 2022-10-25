@@ -13,6 +13,11 @@ struct rounded_buffer *rounded_buffer_alloc(void)
     return buf;
 }
 
+int rounded_buffer_is_free(struct rounded_buffer *ptr)
+{
+    return ptr->w_head == ptr->r_head;
+}
+
 void rounded_buffer_clear(struct rounded_buffer *ptr)
 {
     if (ptr->items != NULL)
@@ -100,7 +105,7 @@ void rounded_buffer_get_item(struct rounded_buffer *ptr, char *to, size_t *size)
     }
 
     item = &ptr->items[ptr->r_head];
-    readed_data = MINIMAL(*size, ROUNDED_BUFFER_ITEM_SIZE);
+    readed_data = item->size;
     memcpy(to, item->buffer, readed_data);
     item->size = 0;
     item->flag = 0;

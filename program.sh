@@ -1,7 +1,6 @@
-
+MODULE_NAME=pshdev.ko
 ROOTFS=./test/rootfs.img
-MODULE=./scull/scull.ko
-MODULE_NAME=scull.ko
+MODULE=./netdev/$MODULE_NAME
 
 mount $ROOTFS /mnt
 cp $MODULE /mnt/usr/src/$MODULE_NAME

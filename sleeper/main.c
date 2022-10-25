@@ -50,8 +50,10 @@ ssize_t static sleeper_read(struct file *filp, char __user *buf, size_t sz, loff
 {
     struct sleeper_dev *dev = filp->private_data;
     size_t readed_data;
-    if (wait_event_interruptible(wait_queue_head, atomic_read(&flag) > 0))
-        return -ERESTARTSYS;
+    if (!dev->length) {
+        if (wait_event_interruptible(wait_queue_head, atomic_read(&flag) > 0))
+            return -ERESTARTSYS;
+    }
     readed_data = dev->length;
     if (copy_to_user(buf, dev->buffer, readed_data))
         return -EFAULT;

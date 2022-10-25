@@ -6,10 +6,10 @@
 import os
 import sys
 
-MODULE_NAME = "SMLM"
-MODULE_FILE = "SMLM.ko"
+MODULE_NAME = "pshdev"
+MODULE_FILE = "pshdev.ko"
 MODULE_TYPE = "c"
-MODULE_COUNT = 4
+MODULE_COUNT = 2
 
 def parse_devices():
     result = {"c": {}, "b": {}}

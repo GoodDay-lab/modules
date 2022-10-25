@@ -29,5 +29,6 @@ void rounded_buffer_add_item(struct rounded_buffer *, const char *, size_t *);
 void rounded_buffer_get_item(struct rounded_buffer *, char *, size_t *);
 void rounded_buffer_clear(struct rounded_buffer *);
 void rounded_buffer_clean(struct rounded_buffer *);
+int rounded_buffer_is_free(struct rounded_buffer *);
 
 #endif
