@@ -44,6 +44,34 @@ static struct net_device_ops psh_netdev_ops = {
 };
 
 
+void psh_init_packet_pool(struct net_device *dev)
+{
+    struct psh_device_priv *pshpriv = netdev_priv(dev);
+    struct psh_packet *pshpkt;
+    int i;
+
+    pshpriv->ppool = NULL;
+    for (i = 0; i < 10; i++) {
+        pshpkt = kmalloc(sizeof(struct psh_packet), GFP_KERNEL);
+        if (pshpkt == NULL)
+            return;
+        pshpkt->dev = dev;
+        pshpkt->next = pshpriv->ppool;
+        pshpriv->ppool = pshpkt;
+    }
+}
+
+void psh_reset_packet_pool(struct net_device *dev)
+{
+    struct psh_device_priv *pshpriv = netdev_priv(dev);
+    struct psh_packet *pshpkt;
+
+    while ((pshpkt = pshpriv->ppool)) {
+        pshpriv->ppool = pshpkt->next;
+        kfree(pshpkt);
+    }
+}
+
 int static psh_init(struct net_device *dev)
 {
     // char dev_addr[] = "\0PSHD0";
@@ -62,6 +90,64 @@ void static psh_uninit(struct net_device *dev)
 {
     netif_stop_queue(dev);
     free_percpu(dev->lstats);
+}
+
+void static psh_rx(struct net_device *dev, struct psh_packet *pkt)
+{
+    struct sk_buff *pshskb;
+    struct psh_device_priv *pshpriv = netdev_priv(dev);
+
+    pshskb = dev_alloc_skb(pkt->datalen + 2);
+    if (!pshskb) {
+        if (printk_ratelimit()) {
+            PSH_DEBUG("low memory => packet dropped\n");
+        }
+        pshpriv->stats.rx_dropped++;
+        return;
+    }
+    skb_reserve(pshskb, 2);
+    memcpy(skb_put(pshskb, pkt->datalen), pkt->data, pkt->datalen);
+
+    pshskb->dev = dev;
+    pshskb->protocol = eth_type_trans(pshskb, dev);
+    pshskb->ip_summed = CHECKSUM_UNNECESSARY;
+    pshpriv->stats.rx_packets++;
+    pshpriv->stats.rx_bytes += pkt->datalen;
+    netif_rx(pshskb);
+}
+
+void static psh_regular_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+{
+    /* Это иммитация hardware прерываний, но на уровне приложения */
+
+    int statusword;
+    struct psh_device_priv *pshpriv;
+    struct psh_packet *pshpkt = NULL;
+    struct net_device *dev = (struct net_device *)dev_id;
+
+    if (!dev)
+        return;
+    spin_lock(&pshpriv->lock);  /* Входим в контекст */
+
+    /* Обновляем статус устройства */
+    pshpriv = netdev_priv(dev);
+    statusword = pshpriv->status;
+    pshpriv->status = 0;
+
+    if (statusword & PSHDEV_RX_INTR) {
+        pshpkt = pshpriv->rx_queue;
+        if (pshpkt) {
+            pshpriv->rx_queue = pshpkt->next;
+            psh_rx(dev, pshpkt);
+        }
+    } else if (statusword & PSHDEV_TX_INTR) {
+        pshpriv->stats.tx_packets++;
+        pshpriv->stats.tx_bytes += pshpriv->tx_packetlen;
+        dev_kfree_skb(pshpriv->skb);
+    }
+
+    spin_unlock(&pshpriv->lock);
+    //if (pshpkt) psh_release_buffer(pshpkt);
 }
 
 netdev_tx_t static psh_start_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -87,16 +173,17 @@ netdev_tx_t static psh_start_xmit(struct sk_buff *skb, struct net_device *dev)
 void static psh_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
     struct psh_device_priv *pshpriv = netdev_priv(dev);
-    pshpriv->status = PSHDEV_TX_INTR;
+    pshpriv->status |= PSHDEV_TX_INTR;
 
-    spin_lock(&pshpriv->lock);
-    pshpriv->stats.tx_packets++;
-    pshpriv->stats.tx_bytes += pshpriv->tx_packetlen;
-    dev_kfree_skb(pshpriv->skb);
-    spin_unlock(&pshpriv->lock);
-
+    psh_regular_interrupt(0, dev, NULL);
     pshpriv->stats.tx_errors++;
     pshpriv->status = 0;
+
+    spin_lock(&pshpriv->lock);
+    psh_reset_packet_pool(dev);
+    psh_init_packet_pool(dev);
+    spin_unlock(&pshpriv->lock);
+
     netif_wake_queue(dev);
 }
 
@@ -115,7 +202,7 @@ void static psh_setup(struct net_device *dev)
 	pshpriv->dev = dev;
 
 	// psh_rx_ints(dev, 1);		/* enable receive interrupts */
-	// psh_setup_pool(dev);
+	psh_init_packet_pool(dev);
 }
 
 void static psh_cleanup(void)

@@ -4,6 +4,14 @@
 #include <linux/netdevice.h>
 #include <linux/types.h>
 
+#define _DEBUG
+
+#ifdef _DEBUG
+#define PSH_DEBUG(msg, args...) printk(KERN_DEBUG "pshdev: "msg, ## args)
+#else
+#define PSH_DEBUG(msg, args...)
+#endif
+
 #define PSHDEV_RX_INTR 0x0001
 #define PSHDEV_TX_INTR 0x0002
 
