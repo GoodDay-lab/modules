@@ -7,6 +7,9 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 
+#include <linux/ip.h>
+#include <linux/tcp.h>
+
 #include "pshdev.h"
 
 /*
@@ -37,14 +40,74 @@ struct psh_device_priv {
 
 static struct net_device *pshdevs[2];
 static struct net_device_ops psh_netdev_ops = {
-    .ndo_init       = psh_init,
-    .ndo_uninit     = psh_uninit,
+    .ndo_open       = psh_init,
+    .ndo_stop       = psh_uninit,
     .ndo_start_xmit = psh_start_xmit,
     .ndo_tx_timeout = psh_tx_timeout
 };
 
+static struct psh_packet *psh_get_tx_buffer(struct net_device *dev)
+{
+    struct psh_device_priv *pshpriv = netdev_priv(dev);
+    struct psh_packet *pshpkt;
+    unsigned long flags;
 
-void psh_init_packet_pool(struct net_device *dev)
+    spin_lock_irqsave(&pshpriv->lock, flags);
+    pshpkt = pshpriv->ppool;
+    if (!pshpkt) return pshpkt;
+
+    pshpriv->ppool = pshpkt->next;
+    if (!pshpriv->ppool) {
+        netif_stop_queue(dev);
+    }
+    spin_unlock_irqrestore(&pshpriv->lock, flags);
+    return pshpkt;
+}
+
+void static psh_release_tx_buffer(struct psh_packet *pshpkt)
+{
+    struct psh_device_priv *pshpriv = netdev_priv(pshpkt->dev);
+    unsigned long flags;
+
+    /* I am paranoid.. */
+    if (!pshpkt) return;
+
+    spin_lock_irqsave(&pshpriv->lock, flags);
+    pshpkt->next = pshpriv->ppool;
+    pshpriv->ppool = pshpkt;
+    spin_unlock_irqrestore(&pshpriv->lock, flags);
+    if (netif_queue_stopped(pshpkt->dev) && !pshpkt->next)
+        netif_wake_queue(pshpkt->dev);
+}
+
+void static psh_enqueue_buffer(struct net_device *dev, struct psh_packet *pshpkt)
+{
+    struct psh_device_priv *pshpriv = netdev_priv(dev);
+    unsigned long flags;
+
+    spin_lock_irqsave(&pshpriv->lock, flags);
+    pshpkt->next = pshpriv->rx_queue;
+    pshpriv->rx_queue = pshpkt;
+    spin_unlock_irqrestore(&pshpriv->lock, flags);
+}
+
+/*
+static struct psh_packet *psh_dequeue_buffer(struct net_device *dev)
+{
+    struct psh_device_priv *pshpriv = netdev_priv(dev);
+    struct psh_packet *pshpkt;
+    unsigned int flags;
+
+    spin_lock_irqsave(&pshpriv->lock, flags);
+    pshpkt = pshpriv->rx_queue;
+    if (pshpkt)
+        pshpriv->rx_queue = pshpkt->next;
+    spin_unlock_irqrestore(&pshpriv->lock, flags);
+    return pshpkt;
+}
+*/
+
+void static psh_init_packet_pool(struct net_device *dev)
 {
     struct psh_device_priv *pshpriv = netdev_priv(dev);
     struct psh_packet *pshpkt;
@@ -61,7 +124,7 @@ void psh_init_packet_pool(struct net_device *dev)
     }
 }
 
-void psh_reset_packet_pool(struct net_device *dev)
+void static psh_reset_packet_pool(struct net_device *dev)
 {
     struct psh_device_priv *pshpriv = netdev_priv(dev);
     struct psh_packet *pshpkt;
@@ -74,22 +137,18 @@ void psh_reset_packet_pool(struct net_device *dev)
 
 int static psh_init(struct net_device *dev)
 {
-    // char dev_addr[] = "\0PSHD0";
-    // dev_addr[5] += (dev == pshdevs[1]);
-    /* Hardware (MAC) address (6 bytes) */
     dev->lstats = netdev_alloc_pcpu_stats(struct pcpu_lstats);
 	if (!dev->lstats)
 		return -ENOMEM;
-    // memcpy((char *)dev->dev_addr, dev_addr, ETH_ALEN);
-    /* starts receiving packets */
     netif_start_queue(dev);
 	return 0;
 }
 
-void static psh_uninit(struct net_device *dev)
+int static psh_uninit(struct net_device *dev)
 {
     netif_stop_queue(dev);
     free_percpu(dev->lstats);
+    return 0;
 }
 
 void static psh_rx(struct net_device *dev, struct psh_packet *pkt)
@@ -98,15 +157,17 @@ void static psh_rx(struct net_device *dev, struct psh_packet *pkt)
     struct psh_device_priv *pshpriv = netdev_priv(dev);
 
     pshskb = dev_alloc_skb(pkt->datalen + 2);
-    if (!pshskb) {
+    if (pshskb == NULL) {
         if (printk_ratelimit()) {
-            PSH_DEBUG("low memory => packet dropped\n");
+            PSH_DEBUG("psh_rx(): not created socket (%d)\n", !pshskb);
         }
         pshpriv->stats.rx_dropped++;
         return;
-    }
+    }    
     skb_reserve(pshskb, 2);
     memcpy(skb_put(pshskb, pkt->datalen), pkt->data, pkt->datalen);
+    PSH_DEBUG("psh_rx(): created socket  (%d)\n"
+              "          socket length:   %u\n", !pshskb, pshskb->len);
 
     pshskb->dev = dev;
     pshskb->protocol = eth_type_trans(pshskb, dev);
@@ -127,6 +188,7 @@ void static psh_regular_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 
     if (!dev)
         return;
+    pshpriv = netdev_priv(dev);
     spin_lock(&pshpriv->lock);  /* Входим в контекст */
 
     /* Обновляем статус устройства */
@@ -135,19 +197,110 @@ void static psh_regular_interrupt(int irq, void *dev_id, struct pt_regs *regs)
     pshpriv->status = 0;
 
     if (statusword & PSHDEV_RX_INTR) {
+        PSH_DEBUG("software interrupt:  RX_INTR\n");
         pshpkt = pshpriv->rx_queue;
         if (pshpkt) {
             pshpriv->rx_queue = pshpkt->next;
             psh_rx(dev, pshpkt);
         }
     } else if (statusword & PSHDEV_TX_INTR) {
+        PSH_DEBUG("software interrupt:  TX_INTR\n");
         pshpriv->stats.tx_packets++;
         pshpriv->stats.tx_bytes += pshpriv->tx_packetlen;
         dev_kfree_skb(pshpriv->skb);
     }
 
     spin_unlock(&pshpriv->lock);
-    //if (pshpkt) psh_release_buffer(pshpkt);
+    if (pshpkt) psh_release_tx_buffer(pshpkt);
+}
+
+void static psh_hw_tx(struct net_device *dev, char *buf, int len)
+{
+    	/*
+	 * This function deals with hw details. This interface loops
+	 * back the packet to the other snull interface (if any).
+	 * In other words, this function implements the snull behaviour,
+	 * while all other procedures are rather device-independent
+	 */
+	struct iphdr *ih;
+	struct net_device *dest;
+	struct psh_device_priv *priv;
+	u32 *saddr, *daddr;
+	struct psh_packet *tx_buffer;
+
+    len = (len < 0 ? -len : len);
+    len = (len > ETH_DATA_LEN ? ETH_DATA_LEN : len);
+    
+	/* I am paranoid. Ain't I? */
+	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+		PSH_DEBUG("Hmm... packet too short (%i octets)\n", len);
+		return;
+	}
+
+	if (0) { /* enable this conditional to look at the data */
+		int i;
+		PSH_DEBUG("len is %i\n" KERN_DEBUG "data:",len);
+		for (i=14 ; i<len; i++)
+			printk(" %02x",buf[i]&0xff);
+		printk("\n");
+	}
+	/*
+	 * Ethhdr is 14 bytes, but the kernel arranges for iphdr
+	 * to be aligned (i.e., ethhdr is unaligned)
+	 */
+	ih = (struct iphdr *)(buf+sizeof(struct ethhdr));
+	saddr = &ih->saddr;
+	daddr = &ih->daddr;
+
+	((u8 *)saddr)[2] ^= 1; /* change the third octet (class C) */
+	((u8 *)daddr)[2] ^= 1;
+
+	ih->check = 0;         /* and rebuild the checksum (ip needs it) */
+	ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
+
+	if (dev == pshdevs[0])
+		PSH_DEBUG("%08x:%05i --> %08x:%05i\n",
+				ntohl(ih->saddr),ntohs(((struct tcphdr *)(ih+1))->source),
+				ntohl(ih->daddr),ntohs(((struct tcphdr *)(ih+1))->dest));
+	else
+		PSH_DEBUG("%08x:%05i <-- %08x:%05i\n",
+				ntohl(ih->daddr),ntohs(((struct tcphdr *)(ih+1))->dest),
+				ntohl(ih->saddr),ntohs(((struct tcphdr *)(ih+1))->source));
+
+	/*
+	 * Ok, now the packet is ready for transmission: first simulate a
+	 * receive interrupt on the twin device, then  a
+	 * transmission-done on the transmitting device
+	 */
+	dest = pshdevs[dev == pshdevs[0] ? 1 : 0];
+	priv = netdev_priv(dest);
+	tx_buffer = psh_get_tx_buffer(dev);
+
+	if(!tx_buffer) {
+		PSH_DEBUG("Out of tx buffer, len is %i\n",len);
+		return;
+	}
+
+	tx_buffer->datalen = len;
+	memcpy(tx_buffer->data, buf, len);
+	psh_enqueue_buffer(dest, tx_buffer);
+	if (priv->rx_int_enabled) {
+		priv->status |= PSHDEV_RX_INTR;
+		psh_regular_interrupt(0, dest, NULL);
+	}
+
+	priv = netdev_priv(dev);
+	priv->tx_packetlen = len;
+	priv->tx_packetdata = buf;
+	priv->status |= PSHDEV_TX_INTR;
+	if (PSHDEV_LOCKUP && ((priv->stats.tx_packets + 1) % PSHDEV_LOCKUP) == 0) {
+        	/* Simulate a dropped transmit interrupt */
+		netif_stop_queue(dev);
+		PSH_DEBUG("Simulate lockup at %ld, txp %ld\n", jiffies,
+				(unsigned long) priv->stats.tx_packets);
+	}
+	else
+		psh_regular_interrupt(0, dev, NULL);
 }
 
 netdev_tx_t static psh_start_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -158,6 +311,7 @@ netdev_tx_t static psh_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
     skdata = skb->data;
     sklen = skb->len;
+    PSH_DEBUG("send packet:  length: %d\n", sklen);
     if (skb->len < ETH_ZLEN) {
         memset(buffer, 0, ETH_ZLEN);
         memcpy(buffer, skdata, sklen);
@@ -167,13 +321,19 @@ netdev_tx_t static psh_start_xmit(struct sk_buff *skb, struct net_device *dev)
     netif_trans_update(dev);
     pshpriv->skb = skb;
 
+    psh_hw_tx(dev, skdata, sklen);
+
     return NETDEV_TX_OK;
 }
 
 void static psh_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
     struct psh_device_priv *pshpriv = netdev_priv(dev);
+    struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
+
     pshpriv->status |= PSHDEV_TX_INTR;
+    PSH_DEBUG("Transmit timeout at %ld, latency %ld\n", jiffies,
+			jiffies - txq->trans_start);
 
     psh_regular_interrupt(0, dev, NULL);
     pshpriv->stats.tx_errors++;
@@ -200,6 +360,7 @@ void static psh_setup(struct net_device *dev)
     memset(pshpriv, 0, sizeof(struct psh_device_priv));
     spin_lock_init(&pshpriv->lock);
 	pshpriv->dev = dev;
+    pshpriv->rx_int_enabled = 1;
 
 	// psh_rx_ints(dev, 1);		/* enable receive interrupts */
 	psh_init_packet_pool(dev);
@@ -212,7 +373,7 @@ void static psh_cleanup(void)
         if (!pshdevs[i]) continue;
         unregister_netdev(pshdevs[i]);
         free_netdev(pshdevs[i]);
-        printk(KERN_INFO "psh%d: netdevice freed and unregistered\n", i);
+        PSH_DEBUG("netdevice freed and unregistered\n");
     }
 }
 
@@ -224,12 +385,12 @@ int static __init psh_init_module(void)
         pshdevs[i] = alloc_netdev(sizeof(struct psh_device_priv), "psh%d", NET_NAME_ENUM, psh_setup);
         if (!pshdevs[i])
             goto out;
-        printk(KERN_INFO "psh%d: netdevice allocated (%d)\n", i, pshdevs[i] == NULL);
+        PSH_DEBUG("netdevice allocated (%d)\n", pshdevs[i] == NULL);
         
         err = register_netdev(pshdevs[i]);
         if (err)
             goto out;
-        printk(KERN_INFO "psh%d: netdevice registered (%d)\n", i, err);
+        PSH_DEBUG("netdevice registered (%d)\n", err);
     }
 
     return 0;
